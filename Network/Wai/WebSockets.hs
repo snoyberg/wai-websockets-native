@@ -6,64 +6,51 @@ module Network.Wai.WebSockets where
 import Network.Wai
 import Control.Exception (Exception, throwIO, assert)
 import Control.Applicative ((<$>))
-import Control.Monad (when, forever, unless)
+import Control.Monad (when, unless)
 import Data.Typeable (Typeable)
-import Network.HTTP.Types (status200, status404)
 import Blaze.ByteString.Builder
 import Data.Monoid ((<>), mempty)
 import qualified Crypto.Hash.SHA1 as SHA1
-import Debug.Trace
 import Data.Word (Word8, Word32, Word64)
 import Data.ByteString (ByteString)
 import Data.Bits ((.|.), testBit, clearBit, shiftL, (.&.), Bits, xor, shiftR)
 import qualified Data.Map as Map
 import Data.Maybe (isJust)
 import qualified Data.ByteString as S
-import qualified Data.ByteString.Char8 as S8
 import qualified Data.ByteString.Base64 as B64
 import Data.IORef
-import Data.Char (toUpper)
-import qualified Data.Conduit as C
 
+
+type IsText = Bool
 
 data Connection = Connection
-    { connSend :: Bool -> ByteString -> IO ()
+    { connSend :: IsText -> ByteString -> IO ()
     , connRecv :: IO ByteString
     }
 
-websocketsApp :: Request -> Maybe (C.Source IO ByteString -> C.Sink ByteString IO () -> (Connection -> IO a) -> IO a)
+type WSApp a
+    = IO ByteString
+   -> (ByteString -> IO ())
+   -> (Connection -> IO a)
+   -> IO a
+
+websocketsApp :: Request -> Maybe (WSApp a)
 websocketsApp req
     -- FIXME handle keep-alive, Upgrade | lookup "connection" reqhs /= Just "Upgrade" = backup sendResponse
     | lookup "upgrade" reqhs /= Just "websocket" = Nothing
     | lookup "sec-websocket-version" reqhs /= Just "13" = Nothing
-    | Just key <- lookup "sec-websocket-key" reqhs = Just $ \src0 sink app -> do
-        (rsrc0, ()) <- src0 C.$$+ return ()
-        rsrcRef <- newIORef rsrc0
-        let recv = do
-                rsrc <- readIORef rsrcRef
-                (rsrc', mbs) <- rsrc C.$$++ C.await
-                writeIORef rsrcRef rsrc'
-                case mbs of
-                    Nothing -> return ""
-                    Just "" -> recv
-                    Just bs -> return bs
-
-        let send x = C.yield x C.$$ sink
+    | Just key <- lookup "sec-websocket-key" reqhs = Just $ \recvRaw sendRaw app -> do
         let handshake = fromByteString "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: "
                      <> fromByteString (B64.encode key')
                      <> fromByteString "\r\n\r\n"
             key' = SHA1.hash $ key <> "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
-        toByteStringIO send handshake
+        toByteStringIO sendRaw handshake
 
-        let msg = "This is a test"
-        toByteStringIO send $ wsDataToBuilder $ Frame True OpText Nothing $ fromIntegral $ S.length msg
-        toByteStringIO send $ wsDataToBuilder $ Payload $ fromByteString msg
+        src <- mkSource recvRaw
 
-        src <- mkSource recv
-
-        let recv front0 = waitForFrame src $ \isFinished opcode _ _ getBS -> do
+        let recv front0 = waitForFrame src $ \isFinished _opcode _ _ getBS' -> do
                 let loop front = do
-                        bs <- getBS
+                        bs <- getBS'
                         if S.null bs
                             then return front
                             else loop $ front . (bs:)
@@ -73,8 +60,8 @@ websocketsApp req
                     else recv front
         app Connection
             { connSend = \isText payload -> do
-                toByteStringIO send $ wsDataToBuilder $ Frame True (if isText then OpText else OpBinary) Nothing $ fromIntegral $ S.length payload
-                send payload
+                let header = Frame True (if isText then OpText else OpBinary) Nothing $ fromIntegral $ S.length payload
+                toByteStringIO sendRaw $ wsDataToBuilder header <> fromByteString payload
             , connRecv = recv id
             }
     | otherwise = Nothing
@@ -140,9 +127,9 @@ getBS (Source next ref) = do
     bs <- readIORef ref
     if S.null bs
         then do
-            bs <- next
-            when (S.null bs) (throwIO ConnectionClosed)
-            return bs
+            bs' <- next
+            when (S.null bs') (throwIO ConnectionClosed)
+            return bs'
         else writeIORef ref S.empty >> return bs
 
 leftover :: Source -> ByteString -> IO ()
@@ -186,7 +173,7 @@ waitForFrame src yield = do
             ()
                 | len' <= 125 -> return $ fromIntegral len'
                 | len' == 126 -> getBytes src 2
-                | assert (len' == 127) otherwise -> getBytes src 8
+                | otherwise -> assert (len' == 127) (getBytes src 8)
 
     mmask <- if isMasked then Just <$> getBytes src 4 else return Nothing
     let unmask' =
@@ -240,3 +227,4 @@ unmask key offset' masked =
     maskByte 1 = fromIntegral $ key `shiftR` 16
     maskByte 2 = fromIntegral $ key `shiftR` 8
     maskByte 3 = fromIntegral key
+    maskByte i = error $ "Network.Wai.WebSockets.unmask.maskByte: invalid input " ++ show i
