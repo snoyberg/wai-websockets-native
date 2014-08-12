@@ -6,7 +6,7 @@ module Network.Wai.WebSockets where
 import Network.Wai
 import Control.Exception (Exception, throwIO, assert)
 import Control.Applicative ((<$>))
-import Control.Monad (when, unless)
+import Control.Monad (when)
 import Data.Typeable (Typeable)
 import Blaze.ByteString.Builder
 import Data.Monoid ((<>), mempty)
@@ -19,23 +19,58 @@ import Data.Maybe (isJust)
 import qualified Data.ByteString as S
 import qualified Data.ByteString.Base64 as B64
 import Data.IORef
-
+import qualified Data.ByteString.Lazy as L
+import Network.HTTP.Types (status400, status500)
 
 type IsText = Bool
 
 data Connection = Connection
-    { connSend :: IsText -> ByteString -> IO ()
-    , connRecv :: IO ByteString
+    { connSendChunk :: IsText -> ByteString -> IO ()
+    , connRecvChunk :: IO ByteString
     }
 
-type WSApp a
-    = IO ByteString
-   -> (ByteString -> IO ())
-   -> (Connection -> IO a)
-   -> IO a
+connSendFrame :: Connection -> IsText -> Builder -> IO ()
+connSendFrame (Connection send _) isText builder =
+    toByteStringIO send' builder
+    send isText S.empty
+  where
+    send' bs
+        | S.null bs = return ()
+        | otherwise = send isText bs
 
-websocketsApp :: Request -> Maybe (WSApp a)
-websocketsApp req
+connRecvFrame :: Connection -> IO L.ByteString
+connRecvFrame (Connection _ recv) =
+    loop id
+  where
+    loop front = do
+        bs <- recv
+        if S.null bs
+            then return $ L.fromChunks $ front [bs]
+            else loop $ front . (bs:)
+
+type WSApp a = Connection -> IO a
+
+type RunWSApp a = IO ByteString -> (ByteString -> IO ()) -> WSApp a -> IO a
+
+websocketsApp :: WSApp () -> Application
+websocketsApp app =
+    websocketsAppOr app badRequest
+  where
+    badRequest _ respond = respond $ responseLBS status400 []
+        "Did not receive a WebSockets request"
+
+websocketsAppOr :: WSApp () -> Application -> Application
+websocketsAppOr app backup req respond =
+    case websocketsAppGeneric req of
+        Nothing -> backup req respond
+        Just run -> respond $ flip responseRaw badHandler
+            $ \recv send -> run recv send app
+  where
+    badHandler = responseLBS status500 []
+        "WAI handler does not support raw responses"
+
+websocketsAppGeneric :: Request -> Maybe (RunWSApp a)
+websocketsAppGeneric req
     -- FIXME handle keep-alive, Upgrade | lookup "connection" reqhs /= Just "Upgrade" = backup sendResponse
     | lookup "upgrade" reqhs /= Just "websocket" = Nothing
     | lookup "sec-websocket-version" reqhs /= Just "13" = Nothing
@@ -48,21 +83,26 @@ websocketsApp req
 
         src <- mkSource recvRaw
 
-        let recv front0 = waitForFrame src $ \isFinished _opcode _ _ getBS' -> do
-                let loop front = do
-                        bs <- getBS'
-                        if S.null bs
-                            then return front
-                            else loop $ front . (bs:)
-                front <- loop front0
-                if isFinished
-                    then return $ S.concat $ front []
-                    else recv front
+        recvState <- newIORef (False, return S.empty)
+
+        let recv = do
+                (isFinished, func) <- readIORef recvState
+                bs <- func
+                if S.null bs
+                    then
+                        if isFinished
+                            then return S.empty
+                            else do
+                                (isFinished', _, _, _, func') <- waitForFrame src
+                                writeIORef recvState (isFinished', func')
+                                recv
+                    else return bs
+
         app Connection
-            { connSend = \isText payload -> do
+            { connSendChunk = \isText payload -> do
                 let header = Frame True (if isText then OpText else OpBinary) Nothing $ fromIntegral $ S.length payload
                 toByteStringIO sendRaw $ wsDataToBuilder header <> fromByteString payload
-            , connRecv = recv id
+            , connRecvChunk = recv
             }
     | otherwise = Nothing
   where
@@ -150,8 +190,8 @@ getBytes src =
         x <- getWord8 src -- FIXME not very efficient, better to use ByteString directly
         loop (shiftL total 8 .|. fromIntegral x) (remaining - 1)
 
-waitForFrame :: Source -> (FrameFinished -> Opcode -> Maybe MaskingKey -> PayloadSize -> IO ByteString -> IO a) -> IO a
-waitForFrame src yield = do
+waitForFrame :: Source -> IO (FrameFinished, Opcode, Maybe MaskingKey, PayloadSize, IO ByteString)
+waitForFrame src = do
     byte1 <- getWord8 src
     byte2 <- getWord8 src
 
@@ -184,13 +224,7 @@ waitForFrame src yield = do
     consumedRef <- newIORef 0
     let getPayload = handlePayload unmask' payloadSize consumedRef
 
-    res <- yield isFinished opcode mmask payloadSize getPayload
-    let drain = do
-            bs <- getPayload
-            unless (S.null bs) drain
-    drain
-    return res
-
+    return (isFinished, opcode, mmask, payloadSize, getPayload)
   where
     handlePayload unmask' totalSize consumedRef = do
         consumed <- readIORef consumedRef
